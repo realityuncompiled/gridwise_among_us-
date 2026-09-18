@@ -1,208 +1,145 @@
-import json
-import os
-from typing import List, Dict, Any
-from google import genai
-from google.genai import types
+"""Gemini-backed operator-note interpretation for GridWise.
 
-# ------------------------------------------------------------------
-# 1. CONSTANTS & GUARDRAIL SETUP
-# ------------------------------------------------------------------
-
-SUPPORTED_DIRECTIVES = {
-    "solar_reduction",
-    "minimum_battery_reserve",
-    "no_charge_window",
-    "no_discharge_window",
-    "max_grid_window",
-    "no_op"
-}
-
-SYSTEM_PROMPT = """You are an expert energy management directive interpreter for a smart campus optimization system.
-Your job is to read operator notes and extract structured directives for a 24-hour energy schedule (hours 0 through 23).
-
-RULES FOR INTERPRETATION:
-1. Output MUST strictly be a JSON array containing exactly one interpretation object per input note, in the exact order of note_index (0, 1, ... N-1).
-2. Allowed directive types are strictly:
-   - solar_reduction -> structured_adjustment: {"hours": [int], "factor": float} (Note: factor is the REMAINING solar fraction. E.g., 80% drop means factor = 0.2)
-   - minimum_battery_reserve -> structured_adjustment: {"hours": [int], "minimum_energy_kwh": float}
-   - no_charge_window -> structured_adjustment: {"hours": [int]}
-   - no_discharge_window -> structured_adjustment: {"hours": [int]}
-   - max_grid_window -> structured_adjustment: {"hours": [int], "max_grid_kwh": float}
-   - no_op -> structured_adjustment: null
-3. Time Windows: Whole-hour intervals. Start hour included, end hour excluded. (e.g., "1 PM to 3 PM" means hours [13, 14]).
-4. If a note is irrelevant to today's 24-hour energy schedule, set applies=false, directive_type="no_op", and structured_adjustment=null.
-5. For all non-no_op directives, set applies=true.
+The model chooses the meaning of a note.  ``directives.validate_directive_interpretations``
+then decides whether that output is safe to use.
 """
 
-# ------------------------------------------------------------------
-# 2. GUARDRAIL VALIDATOR
-# ------------------------------------------------------------------
+from __future__ import annotations
 
-def validate_and_clean_directive(
-    entry: Dict[str, Any], 
-    expected_index: int, 
-    battery_capacity: float
-) -> Dict[str, Any]:
+import json
+import os
+from typing import Any, Literal
+
+from pydantic import BaseModel
+
+from app.directives import DirectiveValidationError, validate_directive_interpretations
+
+
+class LLMInterpretationError(RuntimeError):
+    """A controlled failure that the API layer can turn into a safe response."""
+
+
+SYSTEM_INSTRUCTIONS = """You are the GridWise operator-note interpreter.
+Interpret every operator note for one 24-hour campus energy schedule. Return exactly
+one directive for each input note in note_index order, starting at 0.
+
+The only directive types are:
+- solar_reduction: usable solar becomes a remaining factor during listed hours.
+- minimum_battery_reserve: battery energy after listed hours must be at least a value.
+- no_charge_window: battery charge is prohibited during listed hours.
+- no_discharge_window: battery discharge is prohibited during listed hours.
+- max_grid_window: grid import cannot exceed a value during listed hours.
+- no_op: the note does not affect this energy schedule.
+
+Rules:
+- Use no_op only for irrelevant notes. no_op has applies=false and adjustment=null.
+- Every non-no_op directive has applies=true.
+- Time windows use whole hours: start is included and end is excluded. 1 PM to 3 PM
+  is [13, 14]. Use 0 for midnight and 23 for 11 PM.
+- For solar_reduction, factor is the usable fraction left. An 80% reduction means
+  factor 0.2.
+- Do not invent demand, tariffs, battery limits, hours, numbers, or new directive types.
+- Return only the required JSON object. Keep explanations short.
+"""
+
+
+class _RawDirective(BaseModel):
+    """The constrained outer shape requested from Gemini.
+
+    The next validation layer remains deliberately stricter: it checks the
+    directive-specific adjustment shape and every challenge numeric rule.
     """
-    Validates raw LLM output against strict problem statement guardrails (Section 08).
-    Applies safe fallback for malformed output.
-    """
-    # Guardrail: Index alignment
-    entry["note_index"] = expected_index
 
-    directive_type = entry.get("directive_type")
-
-    # Guardrail: Allowed directive types check
-    if directive_type not in SUPPORTED_DIRECTIVES:
-        return {
-            "note_index": expected_index,
-            "applies": False,
-            "directive_type": "no_op",
-            "structured_adjustment": None,
-            "explanation": "Safe Failure: Unsupported directive type from LLM."
-        }
-
-    # Guardrail: no_op semantics (applies = false, adjustment = null)
-    if directive_type == "no_op":
-        return {
-            "note_index": expected_index,
-            "applies": False,
-            "directive_type": "no_op",
-            "structured_adjustment": None,
-            "explanation": entry.get("explanation", "Note does not affect energy schedule.")
-        }
-
-    # Non-no_op directives must have applies = True
-    entry["applies"] = True
-    adj = entry.get("structured_adjustment") or {}
-
-    # Guardrail: Hours array validation (unique integers 0-23 in ascending order)
-    raw_hours = adj.get("hours", [])
-    if not isinstance(raw_hours, list):
-        raw_hours = []
-    
-    clean_hours = sorted(list(set(
-        [h for h in raw_hours if isinstance(h, int) and 0 <= h <= 23]
-    )))
-    adj["hours"] = clean_hours
-
-    # Guardrail: Numeric limits per directive type
-    if directive_type == "solar_reduction":
-        try:
-            factor = float(adj.get("factor", 1.0))
-            adj["factor"] = max(0.0, min(1.0, factor))  # 0.0 <= factor <= 1.0
-        except (ValueError, TypeError):
-            adj["factor"] = 1.0
-
-    elif directive_type == "minimum_battery_reserve":
-        try:
-            reserve = float(adj.get("minimum_energy_kwh", 0.0))
-            adj["minimum_energy_kwh"] = max(0.0, min(battery_capacity, reserve))
-        except (ValueError, TypeError):
-            adj["minimum_energy_kwh"] = 0.0
-
-    elif directive_type == "max_grid_window":
-        try:
-            max_grid = float(adj.get("max_grid_kwh", 0.0))
-            adj["max_grid_kwh"] = max(0.0, max_grid)
-        except (ValueError, TypeError):
-            adj["max_grid_kwh"] = 0.0
-
-    entry["structured_adjustment"] = adj
-    return entry
+    note_index: int
+    applies: bool
+    directive_type: Literal[
+        "solar_reduction",
+        "minimum_battery_reserve",
+        "no_charge_window",
+        "no_discharge_window",
+        "max_grid_window",
+        "no_op",
+    ]
+    structured_adjustment: dict[str, Any] | None
+    explanation: str
 
 
-def apply_guardrails(
-    raw_interpretations: List[Dict[str, Any]], 
-    num_notes: int, 
-    battery_capacity: float
-) -> List[Dict[str, Any]]:
-    """
-    Enforces exact note count, index ordering, and guardrails for all directives.
-    """
-    cleaned_list = []
-    
-    for i in range(num_notes):
-        # Match entry by index or create fallback if missing
-        raw_entry = next((item for item in raw_interpretations if item.get("note_index") == i), None)
-        
-        if not raw_entry:
-            raw_entry = {
-                "note_index": i,
-                "applies": False,
-                "directive_type": "no_op",
-                "structured_adjustment": None,
-                "explanation": "Fallback: Missing interpretation mapping for this note."
-            }
+class _RawDirectiveEnvelope(BaseModel):
+    directives: list[_RawDirective]
 
-        cleaned_entry = validate_and_clean_directive(raw_entry, i, battery_capacity)
-        cleaned_list.append(cleaned_entry)
 
-    return cleaned_list
+def interpret_and_validate_notes(
+    operator_notes: list[str],
+    *,
+    battery_capacity_kwh: float,
+    model: str | None = None,
+    client: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Use an LLM, then return only deterministic-validator-approved directives."""
+    _validate_operator_notes(operator_notes)
+    raw_output = interpret_operator_notes(operator_notes, model=model, client=client)
+    try:
+        return validate_directive_interpretations(
+            raw_output,
+            note_count=len(operator_notes),
+            battery_capacity_kwh=battery_capacity_kwh,
+        )
+    except DirectiveValidationError as exc:
+        raise LLMInterpretationError(
+            "The model returned an invalid directive interpretation."
+        ) from exc
 
-# ------------------------------------------------------------------
-# 3. LLM INTERPRETER PIPELINE
-# ------------------------------------------------------------------
 
 def interpret_operator_notes(
-    operator_notes: List[str], 
-    battery_capacity: float
-) -> List[Dict[str, Any]]:
-    """
-    Calls Gemini LLM to interpret natural language notes and returns guardrail-validated directives.
-    """
-    if not operator_notes:
-        return []
+    operator_notes: list[str], *, model: str | None = None, client: Any | None = None
+) -> dict[str, Any]:
+    """Call Gemini Structured Outputs and return its JSON object.
 
-    # Format user prompt
-    user_prompt = f"Interpret the following operator notes:\n{json.dumps(operator_notes, indent=2)}"
+    ``client`` is injectable so the API call can be tested without a real key.
+    """
+    _validate_operator_notes(operator_notes)
+    selected_model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    if client is None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise LLMInterpretationError("GEMINI_API_KEY is not configured.")
+        try:
+            from google import genai
+        except ImportError as exc:
+            raise LLMInterpretationError(
+                "Gemini SDK is not installed. Add the google-genai package to requirements.txt."
+            ) from exc
+        client = genai.Client(api_key=api_key)
 
     try:
-        # Initialize Gemini Client (Uses GEMINI_API_KEY environment variable)
-        client = genai.Client()
-        
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=user_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                temperature=0.1
-            ),
+            model=selected_model,
+            contents=json.dumps({"operator_notes": operator_notes}, ensure_ascii=False),
+            config={
+                "system_instruction": SYSTEM_INSTRUCTIONS,
+                "response_mime_type": "application/json",
+                "response_schema": _RawDirectiveEnvelope,
+                "temperature": 0,
+            },
         )
+    except Exception as exc:
+        raise LLMInterpretationError("The LLM provider could not interpret the notes.") from exc
 
-        raw_json_str = response.text
-        raw_interpretations = json.loads(raw_json_str)
+    output_text = getattr(response, "text", None)
+    if not isinstance(output_text, str) or not output_text.strip():
+        raise LLMInterpretationError("The LLM did not return an interpretation.")
+    try:
+        parsed = json.loads(output_text)
+    except json.JSONDecodeError as exc:
+        raise LLMInterpretationError("The LLM returned invalid JSON.") from exc
+    if not isinstance(parsed, dict):
+        raise LLMInterpretationError("The LLM returned an invalid response shape.")
+    return parsed
 
-        if not isinstance(raw_interpretations, list):
-            raw_interpretations = []
 
-    except Exception as e:
-        # Safe Failure Handling (Section 08): Avoid server crashes if LLM call fails
-        raw_interpretations = []
-
-    # Run deterministic guardrails over the LLM output
-    final_directives = apply_guardrails(
-        raw_interpretations=raw_interpretations,
-        num_notes=len(operator_notes),
-        battery_capacity=battery_capacity
-    )
-
-    return final_directives
-
-# ------------------------------------------------------------------
-# 4. LOCAL TESTING / EXAMPLE USAGE
-# ------------------------------------------------------------------
-
-if __name__ == "__main__":
-    # Test case from Problem Statement Section 7.4
-    sample_notes = [
-        "Solar output will drop to about 20% from 1 PM to 3 PM.",
-        "Do not charge the battery between 2 PM and 4 PM.",
-        "The cafeteria menu changes tomorrow."
-    ]
-    sample_battery_capacity = 500.0
-
-    print("Running LLM Interpretation & Guardrail Check...")
-    results = interpret_operator_notes(sample_notes, sample_battery_capacity)
-    print(json.dumps(results, indent=2))
+def _validate_operator_notes(operator_notes: Any) -> None:
+    if not isinstance(operator_notes, list) or not 1 <= len(operator_notes) <= 3:
+        raise ValueError("operator_notes must be a list containing 1 to 3 notes")
+    if any(not isinstance(note, str) or not note.strip() for note in operator_notes):
+        raise ValueError("operator_notes must contain only non-empty strings")
