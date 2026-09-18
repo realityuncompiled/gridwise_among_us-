@@ -5,7 +5,7 @@ Provides GET /health and POST /optimize-energy endpoints according to Problem St
 
 import logging
 from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
@@ -18,6 +18,7 @@ from interpreter import interpret_operator_notes_llm
 from guardrails import validate_and_guard_directives
 from optimizer import solve_energy_optimization
 from verifier import verify_and_recalculate_schedule
+from dashboard_html import DASHBOARD_HTML
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,6 +31,16 @@ app = FastAPI(
     description="LLM-Assisted Operator Directive Interpretation & 24-Hour Energy Scheduling",
     version="1.0.0"
 )
+
+
+# ---------------------------------------------------------------------------
+# Frontend Dashboard Endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_dashboard():
+    """Interactive visual dashboard for demonstrations and video recording."""
+    return HTMLResponse(content=DASHBOARD_HTML)
 
 
 # ---------------------------------------------------------------------------
