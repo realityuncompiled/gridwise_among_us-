@@ -3,22 +3,22 @@ from typing import List
 
 
 class HourData(BaseModel):
-    hour: int
-    demand_kwh: float
-    solar_kwh: float
-    tariff_bdt_per_kwh: float
+    hour: int = Field(ge=0, le=23)
+    demand_kwh: float = Field(ge=0)
+    solar_kwh: float = Field(ge=0)
+    tariff_bdt_per_kwh: float = Field(ge=0)
 
 
 class BatteryConfig(BaseModel):
-    capacity_kwh: float
-    initial_energy_kwh: float
-    minimum_energy_kwh: float
-    max_charge_kwh_per_hour: float
-    max_discharge_kwh_per_hour: float
+    capacity_kwh: float = Field(ge=0)
+    initial_energy_kwh: float = Field(ge=0)
+    minimum_energy_kwh: float = Field(ge=0)
+    max_charge_kwh_per_hour: float = Field(ge=0)
+    max_discharge_kwh_per_hour: float = Field(ge=0)
 
 
 class EnergyScenario(BaseModel):
     scenario_id: str
     operator_notes: List[str] = Field(min_length=1, max_length=3)
-    hours: List[HourData]
+    hours: List[HourData] = Field(min_length=24, max_length=24)
     battery: BatteryConfig
