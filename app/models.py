@@ -1,0 +1,74 @@
+from typing import List, Optional, Literal
+from pydantic import BaseModel, Field
+
+# REQUEST MODELS
+
+class HourData(BaseModel):
+    hour: int = Field(ge=0, le=23)
+    demand_kwh: float = Field(ge=0)
+    solar_kwh: float = Field(ge=0)
+    tariff_bdt_per_kwh: float = Field(ge=0)
+
+class BatteryData(BaseModel):
+    capacity_kwh: float = Field(gt=0)
+    initial_energy_kwh: float = Field(ge=0)
+    minimum_energy_kwh: float = Field(ge=0)
+    max_charge_kwh_per_hour: float = Field(ge=0)
+    max_discharge_kwh_per_hour: float = Field(ge=0)
+
+class OptimizeEnergyRequest(BaseModel):
+    scenario_id: str
+    operator_notes: List[str] = Field(min_items=1, max_items=3)
+    hours: List[HourData] = Field(min_items=24, max_items=24)
+    battery: BatteryData
+
+
+# DIRECTIVE & LLM MODELS
+
+DirectiveType = Literal[
+    "solar_reduction",
+    "minimum_battery_reserve",
+    "no_charge_window",
+    "no_discharge_window",
+    "max_grid_window",
+    "no_op"
+]
+
+class StructuredAdjustment(BaseModel):
+    hours: Optional[List[int]] = None
+    factor: Optional[float] = None
+    minimum_energy_kwh: Optional[float] = None
+    max_grid_kwh: Optional[float] = None
+
+class DirectiveInterpretation(BaseModel):
+    note_index: int
+    applies: bool
+    directive_type: DirectiveType
+    structured_adjustment: Optional[StructuredAdjustment] = None
+    explanation: str
+
+class LLMInterpretationWrapper(BaseModel):
+    interpretations: List[DirectiveInterpretation]
+
+
+# RESPONSE MODELS
+
+class HourlyPlanEntry(BaseModel):
+    hour: int = Field(ge=0, le=23)
+    grid_kwh: float
+    solar_used_kwh: float
+    battery_action: Literal["charge", "discharge", "idle"]
+    battery_kwh: float
+    battery_energy_after_kwh: float
+
+class HealthResponse(BaseModel):
+    status: str = "ok"
+
+class OptimizeEnergyResponse(BaseModel):
+    scenario_id: str
+    directive_interpretation: List[DirectiveInterpretation]
+    hourly_plan: List[HourlyPlanEntry]
+    total_grid_kwh: float
+    total_cost_bdt: float
+    peak_grid_kwh: float
+    plan_summary: str
