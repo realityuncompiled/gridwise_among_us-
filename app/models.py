@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List,  Optional
 class HourData(BaseModel):
     hour: int = Field(ge=0, le=23)
@@ -20,6 +20,16 @@ class EnergyScenario(BaseModel):
     operator_notes: List[str] = Field(min_length=1, max_length=3)
     hours: List[HourData] = Field(min_length=24, max_length=24)
     battery: BatteryConfig
+
+    @field_validator("hours")
+    @classmethod
+    def validate_hours(cls, value):
+        hour_numbers = [item.hour for item in value]
+
+        if hour_numbers != list(range(24)):
+            raise ValueError("hours must contain exactly 0 through 23 in order")
+
+        return value
 class DirectiveInterpretation(BaseModel):
     note_index: int
     original_note: str
